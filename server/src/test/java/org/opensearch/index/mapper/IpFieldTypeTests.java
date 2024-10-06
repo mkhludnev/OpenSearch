@@ -205,14 +205,12 @@ public class IpFieldTypeTests extends FieldTypeTestCase {
         );
 
         // if the list includes a prefix query we fallback to a bool query
-        assertEquals(
-            new ConstantScoreQuery(
-                new BooleanQuery.Builder().add(ft.termQuery("::42", null), Occur.SHOULD)
-                    .add(ft.termQuery("::2/16", null), Occur.SHOULD)
-                    .build()
-            ),
-            ft.termsQuery(Arrays.asList("::42", "::2/16"), null)
-        );
+        Query actual = ft.termsQuery(Arrays.asList("::42", "::2/16"), null);
+        assertTrue(actual instanceof ConstantScoreQuery);
+        assertTrue(((ConstantScoreQuery) actual).getQuery() instanceof BooleanQuery);
+        BooleanQuery bq = (BooleanQuery) ((ConstantScoreQuery) actual).getQuery();
+        assertEquals(2, bq.clauses().size());
+        assertTrue(bq.clauses().stream().allMatch(c -> c.getOccur() == Occur.SHOULD));
     }
 
     public void testDvOnlyTermsQuery() {

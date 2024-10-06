@@ -36,7 +36,12 @@ import org.apache.lucene.document.InetAddressPoint;
 import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.sandbox.search.MultiRangeQuery;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.IndexOrDocValuesQuery;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.PointRangeQuery;
 import org.apache.lucene.search.Query;
@@ -47,6 +52,7 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.logging.DeprecationLogger;
 import org.opensearch.common.network.InetAddresses;
+import org.opensearch.common.network.NetworkAddress;
 import org.opensearch.index.fielddata.IndexFieldData;
 import org.opensearch.index.fielddata.ScriptDocValues;
 import org.opensearch.index.fielddata.plain.SortedSetOrdinalsIndexFieldData;
@@ -58,13 +64,15 @@ import org.opensearch.search.lookup.SearchLookup;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import java.util.function.IntSupplier;
 import java.util.function.Supplier;
-import java.util.stream.Collectors;
 
 /**
  * A {@link FieldMapper} for ip addresses.
@@ -262,43 +270,72 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
         @Override
         public Query termsQuery(List<?> values, QueryShardContext context) {
             failIfNotIndexedAndNoDocValues();
-            InetAddress[] addresses = new InetAddress[values.size()];
-            int i = 0;
-            for (Object value : values) {
-                InetAddress address;
-                if (value instanceof InetAddress) {
-                    address = (InetAddress) value;
+            Tuple<List<InetAddress>, List<String>> ipsMasks = splitIpsAndMasks(values);
+            QueryUnion combiner = new QueryUnion();
+            convertIps(ipsMasks.v1(), combiner);
+            convertMasks(ipsMasks.v2(), context, combiner, combiner.getAsInt());
+            return combiner.get();
+        }
+
+        private void convertMasks(List<String> masks, QueryShardContext context, Consumer<Query> combiner, int clauses) {
+            if (!masks.isEmpty()) {
+                // attempting to avoid too many exception at best
+                if (masks.size() + clauses >= IndexSearcher.getMaxClauseCount() - 1 && isSearchable()) {
+                    IpMultiRangeQueryBuilder multiRange = new IpMultiRangeQueryBuilder(name());
+                    for (String strVal : masks) {
+                        final Tuple<InetAddress, Integer> cidr = InetAddresses.parseCidr(strVal);
+                        PointRangeQuery query = (PointRangeQuery) InetAddressPoint.newPrefixQuery(name(), cidr.v1(), cidr.v2());
+
+                        multiRange.add(query.getLowerPoint(), query.getUpperPoint());
+                    }
+                    combiner.accept(multiRange.build());
                 } else {
-                    if (value instanceof BytesRef) {
-                        value = ((BytesRef) value).utf8ToString();
+                    for (String strVal : masks) {
+                        combiner.accept(termQuery(strVal, context));
                     }
-                    if (value.toString().contains("/")) {
-                        // the `terms` query contains some prefix queries, so we cannot create a set query
-                        // and need to fall back to a disjunction of `term` queries
-                        return super.termsQuery(values, context);
-                    }
-                    address = InetAddresses.forString(value.toString());
                 }
-                addresses[i++] = address;
             }
-            Query dvQuery = null;
-            if (hasDocValues()) {
-                List<BytesRef> bytesRefs = Arrays.stream(addresses)
-                    .distinct()
-                    .map(InetAddressPoint::encode)
-                    .map(BytesRef::new)
-                    .collect(Collectors.<BytesRef>toList());
-                dvQuery = SortedSetDocValuesField.newSlowSetQuery(name(), bytesRefs);
+        }
+
+        private void convertIps(List<InetAddress> inetAddresses, Consumer<Query> combiner) {
+            if (!inetAddresses.isEmpty()) {
+                Supplier<Query> pointsQuery;
+                pointsQuery = () -> inetAddresses.size() == 1
+                    ? InetAddressPoint.newExactQuery(name(), inetAddresses.iterator().next())
+                    : InetAddressPoint.newSetQuery(name(), inetAddresses.toArray(new InetAddress[0]));
+                if (hasDocValues()) {
+                    List<BytesRef> set = new ArrayList<>(inetAddresses.size());
+                    for (final InetAddress address : inetAddresses) {
+                        set.add(new BytesRef(InetAddressPoint.encode(address)));
+                    }
+                    Query dvQuery = SortedSetDocValuesField.newSlowSetQuery(name(), set);
+                    if (!isSearchable()) {
+                        pointsQuery = () -> dvQuery;
+                    } else {
+                        Supplier<Query> wrap = pointsQuery;
+                        pointsQuery = () -> new IndexOrDocValuesQuery(wrap.get(), dvQuery);
+                    }
+                }
+                combiner.accept(pointsQuery.get());
             }
-            Query pointQuery = null;
-            if (isSearchable()) {
-                pointQuery = InetAddressPoint.newSetQuery(name(), addresses);
+        }
+
+        private static Tuple<List<InetAddress>, List<String>> splitIpsAndMasks(List<?> values) {
+            List<InetAddress> concreteIPs = new ArrayList<>();
+            List<String> masks = new ArrayList<>();
+            for (final Object value : values) {
+                if (value instanceof InetAddress) {
+                    concreteIPs.add((InetAddress) value);
+                } else {
+                    final String strVal = (value instanceof BytesRef) ? ((BytesRef) value).utf8ToString() : value.toString();
+                    if (strVal.contains("/")) {
+                        masks.add(strVal);
+                    } else {
+                        concreteIPs.add(InetAddresses.forString(strVal));
+                    }
+                }
             }
-            if (isSearchable() && hasDocValues()) {
-                return new IndexOrDocValuesQuery(pointQuery, dvQuery);
-            } else {
-                return isSearchable() ? pointQuery : dvQuery;
-            }
+            return Tuple.tuple(concreteIPs, masks);
         }
 
         @Override
@@ -442,6 +479,68 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
                 );
             }
             return DocValueFormat.IP;
+        }
+
+        private static class QueryUnion implements Consumer<Query>, Supplier<Query>, IntSupplier {
+            Query first;
+            BooleanQuery.Builder union;
+            int cnt;
+
+            @Override
+            public void accept(Query query) {
+                if (first == null) {
+                    first = query;
+                } else {
+                    if (union == null) {
+                        union = new BooleanQuery.Builder();
+                        union.add(first, BooleanClause.Occur.SHOULD);
+                    }
+                    union.add(query, BooleanClause.Occur.SHOULD);
+                }
+                cnt++;
+            }
+
+            @Override
+            public Query get() {
+                if (union != null) {
+                    return new ConstantScoreQuery(union.build());
+                } else {
+                    if (first != null) {
+                        return first;
+                    } else { // no matches then
+                        return new BooleanQuery.Builder().build();
+                    }
+                }
+            }
+
+            @Override
+            public int getAsInt() {
+                return cnt;
+            }
+        }
+    }
+
+    /**
+     * Union over IP address ranges
+     */
+    public static class IpMultiRangeQueryBuilder extends MultiRangeQuery.Builder {
+        public IpMultiRangeQueryBuilder(String field) {
+            super(field, InetAddressPoint.BYTES, 1);
+        }
+
+        public IpMultiRangeQueryBuilder add(InetAddress lower, InetAddress upper) {
+            add(new MultiRangeQuery.RangeClause(InetAddressPoint.encode(lower), InetAddressPoint.encode(upper)));
+            return this;
+        }
+
+        @Override
+        public MultiRangeQuery build() {
+            return new MultiRangeQuery(field, numDims, bytesPerDim, clauses) {
+                @Override
+                protected String toString(int dimension, byte[] value) {
+                    return NetworkAddress.format(InetAddressPoint.decode(value));
+                }
+            };
         }
     }
 
