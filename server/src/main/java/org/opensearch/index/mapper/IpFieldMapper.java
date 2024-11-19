@@ -271,28 +271,64 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
         public Query termsQuery(List<?> values, QueryShardContext context) {
             failIfNotIndexedAndNoDocValues();
             Tuple<List<InetAddress>, List<String>> ipsMasks = splitIpsAndMasks(values);
-            QueryUnion combiner = new QueryUnion();
-            convertIps(ipsMasks.v1(), combiner);
-            convertMasks(ipsMasks.v2(), context, combiner, combiner.getAsInt());
-            return combiner.get();
+            List<Query> combiner = new ArrayList<>();
+            convertIps(ipsMasks.v1(), combiner::add);
+            convertMasks(ipsMasks.v2(), context, combiner::add, combiner::size);
+            if (combiner.size()==1) {
+                return combiner.get(0);
+            }
+            BooleanQuery.Builder bqb = new BooleanQuery.Builder();
+            for (Query q : combiner) {
+                bqb.add(q, BooleanClause.Occur.SHOULD);
+            }
+            return new ConstantScoreQuery(bqb.build());
         }
 
-        private void convertMasks(List<String> masks, QueryShardContext context, Consumer<Query> combiner, int clauses) {
+        private void convertMasks(List<String> masks, QueryShardContext context, Consumer<Query> combiner, IntSupplier clauses) {
             if (!masks.isEmpty()) {
                 // attempting to avoid too many exception at best
-                if (masks.size() + clauses >= IndexSearcher.getMaxClauseCount() - 1 && isSearchable()) {
-                    IpMultiRangeQueryBuilder multiRange = new IpMultiRangeQueryBuilder(name());
-                    for (String strVal : masks) {
-                        final Tuple<InetAddress, Integer> cidr = InetAddresses.parseCidr(strVal);
-                        PointRangeQuery query = (PointRangeQuery) InetAddressPoint.newPrefixQuery(name(), cidr.v1(), cidr.v2());
-
+                boolean tooMany = masks.size() + clauses.getAsInt() > IndexSearcher.getMaxClauseCount();
+                if (tooMany) {
+                    if (!isSearchable()) {
+                        throw new IndexSearcher.TooManyClauses("can't search for " + masks.size() +
+                            " IP masks in `index:false` field " + name());
+                    }
+                } // let's collect multirange and bq of dv-range
+                // loop masks, collect ranges
+                IpMultiRangeQueryBuilder multiRange = null;
+                BooleanQuery.Builder dvQueries = null;
+                for (String mask : masks) {
+                    final Tuple<InetAddress, Integer> cidr = InetAddresses.parseCidr(mask);
+                    PointRangeQuery query = (PointRangeQuery) InetAddressPoint.newPrefixQuery(name(), cidr.v1(), cidr.v2());
+                    if (isSearchable()) {
+                        if (multiRange==null) {
+                            multiRange = new IpMultiRangeQueryBuilder(name());
+                        }
                         multiRange.add(query.getLowerPoint(), query.getUpperPoint());
                     }
-                    combiner.accept(multiRange.build());
-                } else {
-                    for (String strVal : masks) {
-                        combiner.accept(termQuery(strVal, context));
+                    if (hasDocValues() && !tooMany) {
+                        if (dvQueries==null) {
+                            dvQueries = new BooleanQuery.Builder();
+                        }
+                        dvQueries.add(SortedSetDocValuesField.newSlowRangeQuery(
+                            name(),
+                            new BytesRef(query.getLowerPoint()),
+                            new BytesRef(query.getUpperPoint()),
+                            true,
+                            true
+                        ), BooleanClause.Occur.SHOULD);
                     }
+                }
+                //  && isSearchable()
+                if (multiRange!=null && dvQueries!=null) {
+                    combiner.accept(new IndexOrDocValuesQuery(multiRange.build(), dvQueries.build()));
+                } else {
+                  if (multiRange!=null) {
+                      combiner.accept(multiRange.build());
+                  }
+                  if (dvQueries!=null) {
+                      combiner.accept(dvQueries.build());
+                  }
                 }
             }
         }
@@ -309,13 +345,14 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
                         set.add(new BytesRef(InetAddressPoint.encode(address)));
                     }
                     Query dvQuery = SortedSetDocValuesField.newSlowSetQuery(name(), set);
+                    // TODO remove closure
                     if (!isSearchable()) {
                         pointsQuery = () -> dvQuery;
                     } else {
                         Supplier<Query> wrap = pointsQuery;
                         pointsQuery = () -> new IndexOrDocValuesQuery(wrap.get(), dvQuery);
                     }
-                }
+                }// TODO just a list
                 combiner.accept(pointsQuery.get());
             }
         }
@@ -479,44 +516,6 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
                 );
             }
             return DocValueFormat.IP;
-        }
-
-        private static class QueryUnion implements Consumer<Query>, Supplier<Query>, IntSupplier {
-            Query first;
-            BooleanQuery.Builder union;
-            int cnt;
-
-            @Override
-            public void accept(Query query) {
-                if (first == null) {
-                    first = query;
-                } else {
-                    if (union == null) {
-                        union = new BooleanQuery.Builder();
-                        union.add(first, BooleanClause.Occur.SHOULD);
-                    }
-                    union.add(query, BooleanClause.Occur.SHOULD);
-                }
-                cnt++;
-            }
-
-            @Override
-            public Query get() {
-                if (union != null) {
-                    return new ConstantScoreQuery(union.build());
-                } else {
-                    if (first != null) {
-                        return first;
-                    } else { // no matches then
-                        return new BooleanQuery.Builder().build();
-                    }
-                }
-            }
-
-            @Override
-            public int getAsInt() {
-                return cnt;
-            }
         }
     }
 

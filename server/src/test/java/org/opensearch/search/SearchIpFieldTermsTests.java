@@ -8,11 +8,14 @@
 
 package org.opensearch.search;
 
+import org.apache.lucene.search.IndexSearcher;
 import org.opensearch.action.bulk.BulkRequestBuilder;
+import org.opensearch.action.search.SearchPhaseExecutionException;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.network.InetAddresses;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
@@ -20,18 +23,14 @@ import org.hamcrest.MatcherAssert;
 
 import java.io.IOException;
 import java.net.InetAddress;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.util.*;
+import java.util.function.Consumer;
 
 import static org.opensearch.action.support.WriteRequest.RefreshPolicy.IMMEDIATE;
 import static org.hamcrest.Matchers.equalTo;
 
 public class SearchIpFieldTermsTests extends OpenSearchSingleNodeTestCase {
 
-    public static final boolean IPv4_ONLY = true;
     static String defaultIndexName = "test";
 
     public void testMassive() throws Exception {
@@ -41,21 +40,22 @@ public class SearchIpFieldTermsTests extends OpenSearchSingleNodeTestCase {
 
         BulkRequestBuilder bulkRequestBuilder = client().prepareBulk();
 
+        Set<String> dedupeCidrs = new HashSet<>();
         int cidrs = 0;
         int ips = 0;
         List<String> toQuery = new ArrayList<>();
-        for (int i = 0; ips <= 10240 && cidrs <= 1024 && i < 1000000; i++) {
-            final String ip;
-            final int prefix;
-            if (IPv4_ONLY) {
+        for (int i = 0; ips <= 10240 && cidrs <= IndexSearcher.getMaxClauseCount()+10 && i < 1000000; i++) {
+            String ip;
+            int prefix;
+            boolean mask;
+            do{
+                mask = random().nextBoolean();
                 ip = generateRandomIPv4();
-                prefix = 8 + random().nextInt(24); // CIDR prefix for IPv4
-            } else {
-                ip = generateRandomIPv6();
-                prefix = 32 + random().nextInt(97); // CIDR prefix for IPv6
-            }
+                prefix = 24 + random().nextInt(8); // CIDR prefix for IPv4
+            }while(mask && !dedupeCidrs.add(getFirstThreeOctets(ip)));
 
-            bulkRequestBuilder.add(client().prepareIndex(defaultIndexName).setSource(Map.of("addr", ip)));
+            bulkRequestBuilder.add(client().prepareIndex(defaultIndexName).
+                setSource(Map.of("addr", ip, "dummy_filter", randomSubsetOf(1,"1","2","3"))));
 
             final String termToQuery;
             if (random().nextBoolean()) {
@@ -66,16 +66,32 @@ public class SearchIpFieldTermsTests extends OpenSearchSingleNodeTestCase {
                 ips++;
             }
             toQuery.add(termToQuery);
+
+            if (cidrs == IndexSearcher.getMaxClauseCount()-1) {
+                bulkRequestBuilder.setRefreshPolicy(IMMEDIATE).get();
+                bulkRequestBuilder = client().prepareBulk();
+                long expectedMatches = (long) cidrs + ips ;
+                assertTermsHitCount("addr.dv", toQuery, expectedMatches);
+                // after this passed add dummy filter
+                assertTermsHitCount("addr.dv", toQuery, expectedMatches, (boolBuilder)->{
+                    boolBuilder.filter(QueryBuilders.termsQuery("dummy_filter","1","2","3"))
+                        .filter(QueryBuilders.termsQuery("dummy_filter","1","2","3","4"))
+                        .filter(QueryBuilders.termsQuery("dummy_filter","1","2","3","4","5"));
+                });
+            }
+            if (cidrs == IndexSearcher.getMaxClauseCount()) {// this exceeds clauses precondition
+                bulkRequestBuilder.setRefreshPolicy(IMMEDIATE).get();
+                bulkRequestBuilder = client().prepareBulk();
+                long expectedMatches = (long) cidrs + ips ;
+                assertTermsHitCount("addr.dv", toQuery, expectedMatches);
+            }
         }
         int addMatches = 0;
         for (int i = 0; i < atLeast(100); i++) {
             final String ip;
-            if (IPv4_ONLY) {
-                ip = generateRandomIPv4();
-            } else {
-                ip = generateRandomIPv6();
-            }
-            bulkRequestBuilder.add(client().prepareIndex(defaultIndexName).setSource(Map.of("addr", ip)));
+            ip = generateRandomIPv4();
+            bulkRequestBuilder.add(client().prepareIndex(defaultIndexName).setSource(Map.of("addr", ip,
+                "dummy_filter", randomSubsetOf(1,"1","2","3"))));
             boolean match = false;
             for (String termQ : toQuery) {
                 boolean isCidr = termQ.contains("/");
@@ -93,15 +109,45 @@ public class SearchIpFieldTermsTests extends OpenSearchSingleNodeTestCase {
 
         bulkRequestBuilder.setRefreshPolicy(IMMEDIATE).get();
         long expectedMatches = (long) cidrs + ips + addMatches;
-        for (String field : List.of("addr", "addr.idx", "addr.dv")) {
+        for (String field : List.of("addr", "addr.idx" /*"addr.dv"*/)) {
             assertTermsHitCount(field, toQuery, expectedMatches);
+        }
+
+        try {
+            assertTermsHitCount("addr.dv", toQuery, expectedMatches);
+            fail();
+        }catch (SearchPhaseExecutionException tmc) {
+            Throwable cause = tmc.shardFailures()[0].getCause().getCause();
+            assertTrue (cause instanceof IndexSearcher.TooManyClauses);
+            assertTrue(cause.getMessage().contains("IP"));
+            assertTrue(cause.getMessage().contains("masks"));
         }
     }
 
+    public static String getFirstThreeOctets(String ipAddress) {
+        // Split the IP address by the dot delimiter
+        String[] octets = ipAddress.split("\\.");
+
+        // Take the first three octets
+        String[] firstThreeOctets = new String[3];
+        System.arraycopy(octets, 0, firstThreeOctets, 0, 3);
+
+        // Join the first three octets back together with dots
+        return String.join(".", firstThreeOctets);
+    }
+
     private void assertTermsHitCount(String field, Collection<String> toQuery, long expectedMatches) {
+        assertTermsHitCount(field, toQuery, expectedMatches, (bqb)->{});
+    }
+
+    private void assertTermsHitCount(String field, Collection<String> toQuery, long expectedMatches, Consumer<BoolQueryBuilder> addFilter) {
         TermsQueryBuilder ipTerms = QueryBuilders.termsQuery(field, new ArrayList<>(toQuery));
+        BoolQueryBuilder boolQueryBuilder = QueryBuilders.boolQuery();
+        addFilter.accept(boolQueryBuilder);
         SearchResponse result = client().prepareSearch(defaultIndexName)
-            .setQuery(QueryBuilders.boolQuery().must(ipTerms).filter(QueryBuilders.termsQuery("dummy_filter", "a", "b")))
+            .setQuery(boolQueryBuilder.must(ipTerms)
+                //.filter(QueryBuilders.termsQuery("dummy_filter", "a", "b"))
+                )
             .get();
         long hitsFound = Objects.requireNonNull(result.getHits().getTotalHits()).value;
         MatcherAssert.assertThat(field, hitsFound, equalTo(expectedMatches));
@@ -151,18 +197,6 @@ public class SearchIpFieldTermsTests extends OpenSearchSingleNodeTestCase {
             String.valueOf(random().nextInt(256)),
             String.valueOf(random().nextInt(256))
         );
-    }
-
-    // Generate a random IPv6 address
-    private static String generateRandomIPv6() {
-        StringBuilder ipv6 = new StringBuilder();
-        for (int i = 0; i < 8; i++) {
-            ipv6.append(Integer.toHexString(random().nextInt(0xFFFF + 1)));
-            if (i < 7) {
-                ipv6.append(":");
-            }
-        }
-        return ipv6.toString();
     }
 
     private XContentBuilder createMapping() throws IOException {
