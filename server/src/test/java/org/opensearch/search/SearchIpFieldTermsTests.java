@@ -21,7 +21,6 @@ import org.opensearch.index.query.TermsQueryBuilder;
 import org.opensearch.test.OpenSearchSingleNodeTestCase;
 import org.hamcrest.MatcherAssert;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
