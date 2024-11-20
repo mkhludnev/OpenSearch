@@ -300,7 +300,11 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
                     for (final InetAddress address : inetAddresses) {
                         set.add(new BytesRef(InetAddressPoint.encode(address)));
                     }
-                    dvQuery = SortedSetDocValuesField.newSlowSetQuery(name(), set);
+                    if (set.size() == 1) {
+                        dvQuery = SortedSetDocValuesField.newSlowExactQuery(name(), set.iterator().next());
+                    } else {
+                        dvQuery = SortedSetDocValuesField.newSlowSetQuery(name(), set);
+                    }
                 }
                 final Query out;
                 if (isSearchable() && hasDocValues()) {
