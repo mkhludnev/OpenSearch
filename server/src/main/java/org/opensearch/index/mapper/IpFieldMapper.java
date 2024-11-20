@@ -41,7 +41,6 @@ import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.IndexOrDocValuesQuery;
-import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.PointRangeQuery;
 import org.apache.lucene.search.Query;
@@ -318,28 +317,16 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
 
         private void convertMasks(List<String> masks, QueryShardContext context, List<Query> sink) {
             if (!masks.isEmpty() && (isSearchable() || hasDocValues())) {
-                // scalar IPs might already take some place
-                boolean tooMany = masks.size() + sink.size() > IndexSearcher.getMaxClauseCount();
-                if (tooMany) {
-                    if (!isSearchable()) {
-                        throw new IndexSearcher.TooManyClauses(
-                            "can't search for " + masks.size() + " IP masks in `index:false` field " + name()
-                        );
-                    }
-                } // let's collect multirange and bq of dv-range
-                  // loop masks, collect ranges
                 IpMultiRangeQueryBuilder multiRange = null;
-                List<Query> dvQueries = null;
                 for (String mask : masks) {
                     final Tuple<InetAddress, Integer> cidr = InetAddresses.parseCidr(mask);
                     PointRangeQuery query = (PointRangeQuery) InetAddressPoint.newPrefixQuery(name(), cidr.v1(), cidr.v2());
-                    if (isSearchable()) {
+                    if (isSearchable()) { // even there is DV we don't go with it, since we can't guess clauses limit
                         if (multiRange == null) {
                             multiRange = new IpMultiRangeQueryBuilder(name());
                         }
                         multiRange.add(query.getLowerPoint(), query.getUpperPoint());
-                    }
-                    if (hasDocValues() && !tooMany) {// note searchable && dv && tooMany -> MulirangePoints
+                    } else { // it may hit clauses limit sooner or later
                         Query dvRange = SortedSetDocValuesField.newSlowRangeQuery(
                             name(),
                             new BytesRef(query.getLowerPoint()),
@@ -347,26 +334,12 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
                             true,
                             true
                         );
-                        if (isSearchable()) {
-                            if (dvQueries == null) {
-                                dvQueries = new ArrayList<>();
-                            }
-                            dvQueries.add(dvRange);
-                        } else { // straight to sink
-                            sink.add(dvRange);
-                        }
+                        sink.add(dvRange);
                     }
                 }
-                // && isSearchable()
-                if (multiRange != null && dvQueries != null) {
-                    sink.add(new IndexOrDocValuesQuery(multiRange.build(), union(dvQueries)));
-                } else {
-                    if (multiRange != null) {
-                        sink.add(multiRange.build());
-                    }
-                    if (dvQueries != null) {
-                        sink.addAll(dvQueries);
-                    }
+                // never IndexOrDocValuesQuery() since we can't guess clauses limit
+                if (multiRange != null) {
+                    sink.add(multiRange.build());
                 }
             }
         }

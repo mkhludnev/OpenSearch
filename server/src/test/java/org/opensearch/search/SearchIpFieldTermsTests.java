@@ -9,8 +9,8 @@
 package org.opensearch.search;
 
 import org.apache.lucene.search.IndexSearcher;
-import org.opensearch.OpenSearchException;
 import org.opensearch.action.bulk.BulkRequestBuilder;
+import org.opensearch.action.search.SearchPhaseExecutionException;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.network.InetAddresses;
 import org.opensearch.common.xcontent.XContentFactory;
@@ -22,8 +22,6 @@ import org.opensearch.test.OpenSearchSingleNodeTestCase;
 import org.hamcrest.MatcherAssert;
 
 import java.io.IOException;
-import java.io.PrintWriter;
-import java.io.StringWriter;
 import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -119,8 +117,8 @@ public class SearchIpFieldTermsTests extends OpenSearchSingleNodeTestCase {
                     .filter(QueryBuilders.termsQuery("dummy_filter", "1", "2", "3", "4", "5"));
             });
             fail();
-        } catch (OpenSearchException ose) {
-            assertTrue(dumpException(ose).contains(".IndexSearcher.rewrite("));
+        } catch (SearchPhaseExecutionException ose) {
+            assertTrue("exceeding on query rewrite", ose.shardFailures()[0].getCause() instanceof IndexSearcher.TooManyNestedClauses);
         }
     }
 
@@ -135,19 +133,9 @@ public class SearchIpFieldTermsTests extends OpenSearchSingleNodeTestCase {
         try { // error from mapper/parser
             assertTermsHitCount(indexName, "addr.dv", toQuery, expectMatches);
             fail();
-        } catch (OpenSearchException ose) {
-            String exceptionDump = dumpException(ose);
-            assertTrue(exceptionDump.contains("IP masks"));
-            assertTrue(exceptionDump.contains("IpFieldMapper"));
+        } catch (SearchPhaseExecutionException ose) {
+            assertTrue("exceeding on query building", ose.shardFailures()[0].getCause().getCause() instanceof IndexSearcher.TooManyClauses);
         }
-    }
-
-    private static String dumpException(OpenSearchException ose) {
-        StringWriter stack = new StringWriter();
-        PrintWriter writer = new PrintWriter(stack);
-        ose.printStackTrace(writer);
-        writer.flush();
-        return stack.toString();
     }
 
     public static String getFirstThreeOctets(String ipAddress) {
