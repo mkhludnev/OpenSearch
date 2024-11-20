@@ -24,6 +24,7 @@ import org.hamcrest.MatcherAssert;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -143,11 +144,11 @@ public class SearchIpFieldTermsTests extends OpenSearchSingleNodeTestCase {
     }
 
     private static String dumpException(OpenSearchException ose) {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        PrintWriter printWriter = new PrintWriter(out);
-        ose.printStackTrace(printWriter);
-        printWriter.flush();
-        return out.toString();
+        StringWriter stack = new StringWriter();
+        PrintWriter writer = new PrintWriter(stack);
+        ose.printStackTrace(writer);
+        writer.flush();
+        return stack.toString();
     }
 
     public static String getFirstThreeOctets(String ipAddress) {
