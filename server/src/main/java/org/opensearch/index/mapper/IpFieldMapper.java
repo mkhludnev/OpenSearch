@@ -70,8 +70,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.function.BiFunction;
-import java.util.function.Consumer;
-import java.util.function.IntSupplier;
 import java.util.function.Supplier;
 
 /**
@@ -272,88 +270,100 @@ public class IpFieldMapper extends ParametrizedFieldMapper {
             failIfNotIndexedAndNoDocValues();
             Tuple<List<InetAddress>, List<String>> ipsMasks = splitIpsAndMasks(values);
             List<Query> combiner = new ArrayList<>();
-            convertIps(ipsMasks.v1(), combiner::add);
-            convertMasks(ipsMasks.v2(), context, combiner::add, combiner::size);
-            if (combiner.size()==1) {
+            convertIps(ipsMasks.v1(), combiner);
+            convertMasks(ipsMasks.v2(), context, combiner);
+            if (combiner.size() == 1) {
                 return combiner.get(0);
             }
+            return new ConstantScoreQuery(union(combiner));
+        }
+
+        private Query union(List<Query> combiner) {
             BooleanQuery.Builder bqb = new BooleanQuery.Builder();
             for (Query q : combiner) {
                 bqb.add(q, BooleanClause.Occur.SHOULD);
             }
-            return new ConstantScoreQuery(bqb.build());
+            return bqb.build();
         }
 
-        private void convertMasks(List<String> masks, QueryShardContext context, Consumer<Query> combiner, IntSupplier clauses) {
-            if (!masks.isEmpty()) {
-                // attempting to avoid too many exception at best
-                boolean tooMany = masks.size() + clauses.getAsInt() > IndexSearcher.getMaxClauseCount();
-                if (tooMany) {
-                    if (!isSearchable()) {
-                        throw new IndexSearcher.TooManyClauses("can't search for " + masks.size() +
-                            " IP masks in `index:false` field " + name());
-                    }
-                } // let's collect multirange and bq of dv-range
-                // loop masks, collect ranges
-                IpMultiRangeQueryBuilder multiRange = null;
-                BooleanQuery.Builder dvQueries = null;
-                for (String mask : masks) {
-                    final Tuple<InetAddress, Integer> cidr = InetAddresses.parseCidr(mask);
-                    PointRangeQuery query = (PointRangeQuery) InetAddressPoint.newPrefixQuery(name(), cidr.v1(), cidr.v2());
-                    if (isSearchable()) {
-                        if (multiRange==null) {
-                            multiRange = new IpMultiRangeQueryBuilder(name());
-                        }
-                        multiRange.add(query.getLowerPoint(), query.getUpperPoint());
-                    }
-                    if (hasDocValues() && !tooMany) {
-                        if (dvQueries==null) {
-                            dvQueries = new BooleanQuery.Builder();
-                        }
-                        dvQueries.add(SortedSetDocValuesField.newSlowRangeQuery(
-                            name(),
-                            new BytesRef(query.getLowerPoint()),
-                            new BytesRef(query.getUpperPoint()),
-                            true,
-                            true
-                        ), BooleanClause.Occur.SHOULD);
-                    }
+        private void convertIps(List<InetAddress> inetAddresses, List<Query> sink) {
+            if (!inetAddresses.isEmpty() && (isSearchable() || hasDocValues())) {
+                Query pointsQuery = null;
+                if (isSearchable()) {
+                    pointsQuery = inetAddresses.size() == 1
+                        ? InetAddressPoint.newExactQuery(name(), inetAddresses.iterator().next())
+                        : InetAddressPoint.newSetQuery(name(), inetAddresses.toArray(new InetAddress[0]));
                 }
-                //  && isSearchable()
-                if (multiRange!=null && dvQueries!=null) {
-                    combiner.accept(new IndexOrDocValuesQuery(multiRange.build(), dvQueries.build()));
-                } else {
-                  if (multiRange!=null) {
-                      combiner.accept(multiRange.build());
-                  }
-                  if (dvQueries!=null) {
-                      combiner.accept(dvQueries.build());
-                  }
-                }
-            }
-        }
-
-        private void convertIps(List<InetAddress> inetAddresses, Consumer<Query> combiner) {
-            if (!inetAddresses.isEmpty()) {
-                Supplier<Query> pointsQuery;
-                pointsQuery = () -> inetAddresses.size() == 1
-                    ? InetAddressPoint.newExactQuery(name(), inetAddresses.iterator().next())
-                    : InetAddressPoint.newSetQuery(name(), inetAddresses.toArray(new InetAddress[0]));
+                Query dvQuery = null;
                 if (hasDocValues()) {
                     List<BytesRef> set = new ArrayList<>(inetAddresses.size());
                     for (final InetAddress address : inetAddresses) {
                         set.add(new BytesRef(InetAddressPoint.encode(address)));
                     }
-                    Query dvQuery = SortedSetDocValuesField.newSlowSetQuery(name(), set);
-                    // TODO remove closure
+                    dvQuery = SortedSetDocValuesField.newSlowSetQuery(name(), set);
+                }
+                final Query out;
+                if (isSearchable() && hasDocValues()) {
+                    out = new IndexOrDocValuesQuery(pointsQuery, dvQuery);
+                } else {
+                    out = isSearchable() ? pointsQuery : dvQuery;
+                }
+                sink.add(out);
+            }
+        }
+
+        private void convertMasks(List<String> masks, QueryShardContext context, List<Query> sink) {
+            if (!masks.isEmpty() && (isSearchable() || hasDocValues())) {
+                // scalar IPs might already take some place
+                boolean tooMany = masks.size() + sink.size() > IndexSearcher.getMaxClauseCount();
+                if (tooMany) {
                     if (!isSearchable()) {
-                        pointsQuery = () -> dvQuery;
-                    } else {
-                        Supplier<Query> wrap = pointsQuery;
-                        pointsQuery = () -> new IndexOrDocValuesQuery(wrap.get(), dvQuery);
+                        throw new IndexSearcher.TooManyClauses(
+                            "can't search for " + masks.size() + " IP masks in `index:false` field " + name()
+                        );
                     }
-                }// TODO just a list
-                combiner.accept(pointsQuery.get());
+                } // let's collect multirange and bq of dv-range
+                  // loop masks, collect ranges
+                IpMultiRangeQueryBuilder multiRange = null;
+                List<Query> dvQueries = null;
+                for (String mask : masks) {
+                    final Tuple<InetAddress, Integer> cidr = InetAddresses.parseCidr(mask);
+                    PointRangeQuery query = (PointRangeQuery) InetAddressPoint.newPrefixQuery(name(), cidr.v1(), cidr.v2());
+                    if (isSearchable()) {
+                        if (multiRange == null) {
+                            multiRange = new IpMultiRangeQueryBuilder(name());
+                        }
+                        multiRange.add(query.getLowerPoint(), query.getUpperPoint());
+                    }
+                    if (hasDocValues() && !tooMany) {// note searchable && dv && tooMany -> MulirangePoints
+                        Query dvRange = SortedSetDocValuesField.newSlowRangeQuery(
+                            name(),
+                            new BytesRef(query.getLowerPoint()),
+                            new BytesRef(query.getUpperPoint()),
+                            true,
+                            true
+                        );
+                        if (isSearchable()) {
+                            if (dvQueries == null) {
+                                dvQueries = new ArrayList<>();
+                            }
+                            dvQueries.add(dvRange);
+                        } else { // straight to sink
+                            sink.add(dvRange);
+                        }
+                    }
+                }
+                // && isSearchable()
+                if (multiRange != null && dvQueries != null) {
+                    sink.add(new IndexOrDocValuesQuery(multiRange.build(), union(dvQueries)));
+                } else {
+                    if (multiRange != null) {
+                        sink.add(multiRange.build());
+                    }
+                    if (dvQueries != null) {
+                        sink.addAll(dvQueries);
+                    }
+                }
             }
         }
 
